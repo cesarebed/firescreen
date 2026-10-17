@@ -23,6 +23,8 @@ import java.nio.charset.StandardCharsets;
  *   2 FRAME   one H.264 access unit, Annex B
  *   3 CODEC   SPS + PPS, Annex B, queued as codec config
  *   4 TIMED   [capture time us, i64 big-endian][access unit]; presented at the sender's cadence
+ *   5 AUDIO   [capture time us of first sample, i64 big-endian][s16le interleaved PCM]
+ *   6 AUDIOCFG ascii "sampleRate,channels"; (re)creates the audio player
  */
 final class StreamServer extends Thread {
 
@@ -37,6 +39,8 @@ final class StreamServer extends Thread {
     private static final int TYPE_FRAME = 2;
     private static final int TYPE_CODEC = 3;
     private static final int TYPE_TIMED = 4;
+    private static final int TYPE_AUDIO = 5;
+    private static final int TYPE_AUDIO_CONFIG = 6;
     private static final int MAX_PACKET = 8 * 1024 * 1024;
     static final Stats STATS = new Stats();
     /** Per-frame in/out log for latency debugging: adb shell setprop log.tag.FireScreenTrace VERBOSE */
@@ -93,7 +97,9 @@ final class StreamServer extends Thread {
 
     private void serve(Socket socket) throws IOException {
         DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 256 * 1024));
+        PlayoutClock clock = new PlayoutClock();
         Decoder decoder = null;
+        AudioPlayer audio = null;
         byte[] buf = new byte[512 * 1024];
         try {
             while (running) {
@@ -118,7 +124,8 @@ final class StreamServer extends Thread {
                         String mime = parts.length > 4 && parts[4].trim().equals("hevc")
                                 ? MediaFormat.MIMETYPE_VIDEO_HEVC : MediaFormat.MIMETYPE_VIDEO_AVC;
                         if (decoder != null) decoder.release();
-                        decoder = new Decoder(surface, mime, width, height, fps, delayMs * 1_000_000L);
+                        clock.setPlayoutDelayNs(delayMs * 1_000_000L);
+                        decoder = new Decoder(surface, mime, width, height, fps, clock);
                         listener.onStreaming(width + "x" + height + "@" + fps);
                         break;
                     }
@@ -127,14 +134,30 @@ final class StreamServer extends Thread {
                         break;
                     case TYPE_FRAME:
                         STATS.received(length);
-                        if (decoder != null) decoder.queue(buf, 0, length, 0, System.nanoTime() / 1000);
+                        long nowUs = System.nanoTime() / 1000;
+                        STATS.arrivalJitter(clock.arrived(nowUs));
+                        if (decoder != null) decoder.queue(buf, 0, length, 0, nowUs);
                         break;
                     case TYPE_TIMED: {
                         STATS.received(length);
                         long captureUs = ByteBuffer.wrap(buf, 0, 8).getLong();
+                        // Video alone sets the baseline: it is the reference audio is aligned to.
+                        STATS.arrivalJitter(clock.arrived(captureUs));
                         if (decoder != null) decoder.queue(buf, 8, length - 8, 0, captureUs);
                         break;
                     }
+                    case TYPE_AUDIO_CONFIG: {
+                        String[] parts = new String(buf, 0, length, StandardCharsets.US_ASCII).split(",");
+                        if (audio != null) audio.release();
+                        audio = new AudioPlayer(clock, Integer.parseInt(parts[0].trim()),
+                                Integer.parseInt(parts[1].trim()));
+                        break;
+                    }
+                    case TYPE_AUDIO:
+                        if (audio != null && length > 8) {
+                            audio.enqueue(ByteBuffer.wrap(buf, 0, 8).getLong(), buf, 8, length - 8);
+                        }
+                        break;
                     default:
                         // Unknown packet types are skipped so newer senders stay compatible.
                         break;
@@ -142,6 +165,7 @@ final class StreamServer extends Thread {
             }
         } finally {
             if (decoder != null) decoder.release();
+            if (audio != null) audio.release();
         }
     }
 
@@ -151,6 +175,21 @@ final class StreamServer extends Thread {
         private long bytes, waitNs, decodeUsMax, decodeUsTotal, gapNsMax, lastArrival, windowStart = System.nanoTime();
         private long lastShown, shownGapNsMax, jitterNsTotal, jitterNsMax, codecNsTotal, codecNsMax;
         private int jitterCount, codecCount;
+        private int audioChunks;
+        volatile long syncDelayNs, audioQueuedNs, audioOutputLatencyNs, audioArrivalLagNs;
+        private long audioErrAbsTotal, audioErrAbsMax, audioPaddedNs, audioSkippedNs;
+
+        /** Scheduling error of a chunk before correction; positive = would have played late. */
+        synchronized void audioError(long ns) {
+            audioChunks++;
+            audioErrAbsTotal += Math.abs(ns);
+            audioErrAbsMax = Math.max(audioErrAbsMax, Math.abs(ns));
+        }
+
+        synchronized void audioCorrection(long skippedNs, long paddedNs) {
+            audioSkippedNs += skippedNs;
+            audioPaddedNs += paddedNs;
+        }
 
         /** How much later than the fastest frame this one arrived. */
         synchronized void arrivalJitter(long ns) {
@@ -193,11 +232,17 @@ final class StreamServer extends Thread {
 
         private void maybeFlush(long now) {
             if (now - windowStart < 1_000_000_000L) return;
-            Log.i(TAG, String.format("stats rx=%d %.1fMbps maxgap=%dms shown maxgap=%dms jitter avg=%dms max=%dms codec avg=%dms max=%dms inputwait=%dms rendered=%d total avg=%dms max=%dms",
+            Log.i(TAG, String.format("stats rx=%d %.1fMbps maxgap=%dms shown maxgap=%dms jitter avg=%dms max=%dms codec avg=%dms max=%dms inputwait=%dms rendered=%d total avg=%dms max=%dms audio n=%d err avg=%dms max=%dms pad=%dms skip=%dms sync=%dms (arrival lag %dms, track queue %dms, output %dms)",
                     frames, bytes * 8 / 1e6, gapNsMax / 1_000_000, shownGapNsMax / 1_000_000,
                     jitterCount > 0 ? jitterNsTotal / jitterCount / 1_000_000 : 0, jitterNsMax / 1_000_000,
                     codecCount > 0 ? codecNsTotal / codecCount / 1_000_000 : 0, codecNsMax / 1_000_000, waitNs / 1_000_000, rendered,
-                    rendered > 0 ? decodeUsTotal / rendered / 1000 : 0, decodeUsMax / 1000));
+                    rendered > 0 ? decodeUsTotal / rendered / 1000 : 0, decodeUsMax / 1000,
+                    audioChunks, audioChunks > 0 ? audioErrAbsTotal / audioChunks / 1_000_000 : 0,
+                    audioErrAbsMax / 1_000_000, audioPaddedNs / 1_000_000, audioSkippedNs / 1_000_000,
+                    syncDelayNs / 1_000_000, audioArrivalLagNs / 1_000_000, audioQueuedNs / 1_000_000,
+                    audioOutputLatencyNs / 1_000_000));
+            audioChunks = 0;
+            audioErrAbsTotal = audioErrAbsMax = audioPaddedNs = audioSkippedNs = 0;
             frames = rendered = jitterCount = codecCount = 0;
             jitterNsTotal = jitterNsMax = codecNsTotal = codecNsMax = 0;
             bytes = waitNs = decodeUsMax = decodeUsTotal = gapNsMax = shownGapNsMax = 0;
@@ -214,25 +259,21 @@ final class StreamServer extends Thread {
     }
 
     /**
-     * Hardware H.264 decoder. Frames are presented at the sender's capture cadence, a fixed
-     * delay after the fastest observed arrival, so Wi-Fi and capture jitter do not reach the screen.
+     * Hardware H.264/HEVC decoder. Frames are presented at the sender's capture cadence (see
+     * PlayoutClock), so Wi-Fi and capture jitter do not reach the screen.
      */
     private static final class Decoder {
-        /** Jitter budget: how much later than the fastest frame any frame may arrive and still be on time. */
-        private final long playoutDelayNs;
+        private final PlayoutClock clock;
 
         private final MediaCodec codec;
         private final Thread drain;
         private volatile boolean alive = true;
-        /** Smallest (arrival - capture) seen, in receiver nanoseconds; tracks clock offset + base latency. */
-        private volatile long baselineNs;
-        private boolean haveBaseline;
         /** captureUs -> nanoTime when queued, to measure time spent inside the codec. */
         private final java.util.concurrent.ConcurrentHashMap<Long, Long> queuedAt =
                 new java.util.concurrent.ConcurrentHashMap<>();
 
-        Decoder(Surface surface, String mime, int width, int height, int fps, long playoutDelayNs) throws IOException {
-            this.playoutDelayNs = playoutDelayNs;
+        Decoder(Surface surface, String mime, int width, int height, int fps, PlayoutClock clock) throws IOException {
+            this.clock = clock;
             MediaFormat format = MediaFormat.createVideoFormat(mime, width, height);
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height);
             format.setInteger(MediaFormat.KEY_PRIORITY, 0); // real-time
@@ -251,11 +292,6 @@ final class StreamServer extends Thread {
         }
 
         void queue(byte[] data, int offset, int length, int flags, long captureUs) {
-            if (flags == 0) {
-                long delta = System.nanoTime() - captureUs * 1000;
-                updateBaseline(delta);
-                STATS.arrivalJitter(delta - baselineNs);
-            }
             while (alive) {
                 int index;
                 long waitStart = System.nanoTime();
@@ -293,16 +329,6 @@ final class StreamServer extends Thread {
             return false;
         }
 
-        private void updateBaseline(long delta) {
-            if (!haveBaseline || delta < baselineNs) {
-                baselineNs = delta;
-                haveBaseline = true;
-            } else {
-                // Creep up slowly so clock drift or a slower route cannot leave us permanently late.
-                baselineNs += (delta - baselineNs) >> 9;
-            }
-        }
-
         private void drainLoop() {
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             while (alive) {
@@ -319,13 +345,15 @@ final class StreamServer extends Thread {
                     STATS.codecTime(now - queued);
                     if (TRACE) Log.i(TAG, "out " + info.presentationTimeUs / 1000 + " codec=" + (now - queued) / 1_000_000 + "ms");
                 }
-                long due = info.presentationTimeUs * 1000 + baselineNs + playoutDelayNs;
-                STATS.rendered((now - (due - playoutDelayNs)) / 1000);
+                long due = clock.videoDueNs(info.presentationTimeUs);
+                STATS.rendered((now - due) / 1000);
                 if (due <= now || due - now > 500_000_000L) {
                     STATS.shown(now);
+                    clock.videoShown(due, now);
                     codec.releaseOutputBuffer(index, true); // late (or clock jump): show now
                 } else {
                     STATS.shown(due);
+                    clock.videoShown(due, due);
                     codec.releaseOutputBuffer(index, due);
                 }
             }

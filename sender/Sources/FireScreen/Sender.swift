@@ -10,6 +10,10 @@ final class Sender {
         case codec = 3
         /// [capture time µs, i64 BE][access unit]; the receiver paces presentation with it.
         case timedFrame = 4
+        /// [capture time µs of the first sample, i64 BE][s16le interleaved PCM]
+        case audio = 5
+        /// ascii "sampleRate,channels"
+        case audioConfig = 6
     }
 
     var onReady: (() -> Void)?
@@ -55,6 +59,19 @@ final class Sender {
     /// codec: "avc" or "hevc".
     func sendConfig(width: Int, height: Int, fps: Int, playoutDelayMs: Int, codec: String) {
         send(.config, Data("\(width),\(height),\(fps),\(playoutDelayMs),\(codec)".utf8))
+    }
+
+    func sendAudioConfig(sampleRate: Int, channels: Int) {
+        send(.audioConfig, Data("\(sampleRate),\(channels)".utf8))
+    }
+
+    /// Audio is never dropped: it is small next to video, and gaps would be audible.
+    func sendAudio(_ pcm: Data, captureTime: CMTime) {
+        var payload = Data(capacity: pcm.count + 8)
+        var micros = Int64(CMTimeGetSeconds(captureTime) * 1_000_000).bigEndian
+        withUnsafeBytes(of: &micros) { payload.append(contentsOf: $0) }
+        payload.append(pcm)
+        send(.audio, payload)
     }
 
     func sendCodec(_ parameterSets: Data) {

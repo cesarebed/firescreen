@@ -18,17 +18,20 @@ struct Options {
     var stats = false
     var smooth = false
     var hevc = true
+    var audio = true
 
     static let usage = """
     Usage: FireScreen [--host IP] [--port N] [--mode extend|mirror] [--size WxH] [--fps N]
                       [--bitrate MBPS] [--hidpi] [--smooth] [--codec hevc|h264]
-                      [--no-launch] [--stats]
+                      [--no-audio] [--no-launch] [--stats]
 
       extend   creates a virtual monitor and streams it (default)
       mirror   streams the main display
       --hidpi  extend only: Retina-style virtual monitor (sharper text, larger UI)
       --smooth  steadier motion for films: ~70 ms more delay on the TV
       --codec   hevc (default, less bandwidth) or h264
+      --no-audio  keep sound on the Mac instead of sending it to the TV
+                  (with audio on, the Mac is muted while streaming and restored on exit)
       --no-launch  do not start the receiver app on the Fire TV through adb
     """
 
@@ -56,6 +59,7 @@ struct Options {
             case "--no-launch": options.launchReceiver = false
             case "--stats": options.stats = true
             case "--smooth": options.smooth = true
+            case "--no-audio": options.audio = false
             case "--codec":
                 switch value(arg) {
                 case "h264": options.hevc = false
@@ -71,6 +75,7 @@ struct Options {
 }
 
 func fail(_ message: String) -> Never {
+    MacOutput.restore()
     FileHandle.standardError.write(Data("firescreen: \(message)\n".utf8))
     exit(1)
 }
@@ -94,6 +99,27 @@ func launchReceiver(host: String) {
         process.waitUntilExit()
     }
     Thread.sleep(forTimeInterval: 1.5) // let the receiver open its port
+}
+
+/// Mutes the Mac's own output while sound goes to the TV; ScreenCaptureKit still captures it.
+enum MacOutput {
+    private static var wasMuted: Bool?
+
+    static func muteForStreaming() {
+        let state = run("output muted of (get volume settings)")
+        wasMuted = state == "true"
+        if wasMuted == false { _ = run("set volume with output muted") }
+    }
+
+    static func restore() {
+        if wasMuted == false { _ = run("set volume without output muted") }
+        wasMuted = nil
+    }
+
+    private static func run(_ source: String) -> String? {
+        var error: NSDictionary?
+        return NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
+    }
 }
 
 final class Session {
@@ -154,6 +180,10 @@ final class Session {
             self.sender.sendConfig(width: self.options.width, height: self.options.height, fps: self.options.fps,
                                    playoutDelayMs: self.options.smooth ? 120 : 50,
                                    codec: self.options.hevc ? "hevc" : "avc")
+            if self.options.audio {
+                self.sender.sendAudioConfig(sampleRate: Capturer.audioSampleRate, channels: Capturer.audioChannels)
+                DispatchQueue.main.async { MacOutput.muteForStreaming() }
+            }
             self.encoder.resetParameterSets()
             self.startCapture(displayID)
         }
@@ -169,11 +199,15 @@ final class Session {
             self.frameLock.unlock()
             self.encoder.encode(buffer, pts: pts)
         }
+        capturer.onAudio = { [weak self] pcm, pts in
+            Stats.shared.audio(pcm)
+            self?.sender.sendAudio(pcm, captureTime: pts)
+        }
         capturer.onError = { fail($0) }
         Task {
             do {
                 try await capturer.start(displayID: displayID, width: options.width, height: options.height,
-                                         fps: options.fps)
+                                         fps: options.fps, audio: options.audio)
             } catch {
                 fail("capture: \(error.localizedDescription)")
             }
@@ -219,6 +253,7 @@ final class Session {
     }
 
     func stop() {
+        MacOutput.restore()
         sender?.stop()
         virtualDisplay = nil // removes the virtual monitor
     }

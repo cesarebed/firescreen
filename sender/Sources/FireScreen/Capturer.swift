@@ -2,15 +2,22 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
-/// Captures one display with ScreenCaptureKit, scaled to the stream size.
+/// Captures one display, plus system audio, with ScreenCaptureKit. Video is scaled to the
+/// stream size. Audio and video timestamps share the host clock, which is what keeps them in sync.
 final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
+    static let audioSampleRate = 48_000
+    static let audioChannels = 2
+
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
+    /// (interleaved signed 16-bit little-endian PCM, capture time of its first sample)
+    var onAudio: ((Data, CMTime) -> Void)?
     var onError: ((String) -> Void)?
 
     private var stream: SCStream?
     private let queue = DispatchQueue(label: "firescreen.capture", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "firescreen.audio", qos: .userInteractive)
 
-    func start(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int) async throws {
+    func start(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Int, audio: Bool) async throws {
         let display = try await Self.findDisplay(displayID)
 
         let config = SCStreamConfiguration()
@@ -22,12 +29,16 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.queueDepth = 4
         config.showsCursor = true
-        config.capturesAudio = false
         config.preservesAspectRatio = true
+        config.capturesAudio = audio
+        config.sampleRate = Self.audioSampleRate
+        config.channelCount = Self.audioChannels
+        config.excludesCurrentProcessAudio = true
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if audio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue) }
         try await stream.startCapture()
         self.stream = stream
     }
@@ -49,6 +60,12 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio {
+            if sample.isValid, let pcm = Self.int16Interleaved(sample) {
+                onAudio?(pcm, CMSampleBufferGetPresentationTimeStamp(sample))
+            }
+            return
+        }
         guard type == .screen, sample.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
@@ -56,6 +73,52 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
               SCFrameStatus(rawValue: rawStatus) == .complete,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
         onFrame?(pixelBuffer, CMSampleBufferGetPresentationTimeStamp(sample))
+    }
+
+    /// ScreenCaptureKit delivers 32-bit float PCM, usually one buffer per channel.
+    private static func int16Interleaved(_ sample: CMSampleBuffer) -> Data? {
+        guard let format = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0, asbd.mBitsPerChannel == 32 else { return nil }
+        let frames = CMSampleBufferGetNumSamples(sample)
+        let channels = Int(asbd.mChannelsPerFrame)
+        let interleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+
+        var listSize = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sample, bufferListSizeNeededOut: &listSize, bufferListOut: nil, bufferListSize: 0,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+        let listMemory = UnsafeMutableRawPointer.allocate(byteCount: listSize, alignment: 16)
+        defer { listMemory.deallocate() }
+        let list = listMemory.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var block: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sample, bufferListSizeNeededOut: nil, bufferListOut: list, bufferListSize: listSize,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, blockBufferOut: &block) == noErr
+        else { return nil }
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+
+        func sampleAt(_ frame: Int, _ channel: Int) -> Float {
+            let c = min(channel, channels - 1) // mono source: duplicate into both outputs
+            if interleaved {
+                return buffers[0].mData!.assumingMemoryBound(to: Float.self)[frame * channels + c]
+            }
+            return buffers[c].mData!.assumingMemoryBound(to: Float.self)[frame]
+        }
+
+        var out = Data(count: frames * audioChannels * 2)
+        out.withUnsafeMutableBytes { raw in
+            let pcm = raw.bindMemory(to: Int16.self)
+            for frame in 0..<frames {
+                for channel in 0..<audioChannels {
+                    let v = max(-1, min(1, sampleAt(frame, channel)))
+                    pcm[frame * audioChannels + channel] = Int16(v * 32767).littleEndian
+                }
+            }
+        }
+        return out
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

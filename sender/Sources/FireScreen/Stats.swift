@@ -17,6 +17,8 @@ final class Stats {
     private var keyframes = 0
     private var keyframeBytesMax = 0
     private var inFlightMax = 0
+    private var audioPackets = 0
+    private var audioPeak: Int16 = 0
     private var timer: DispatchSourceTimer?
 
     func start() {
@@ -58,6 +60,17 @@ final class Stats {
 
     func drop() { update { dropped += 1 } }
 
+    func audio(_ pcm: Data) {
+        var peak: Int16 = 0
+        pcm.withUnsafeBytes { raw in
+            for v in raw.bindMemory(to: Int16.self) where v != .min { peak = max(peak, abs(v)) }
+        }
+        update {
+            audioPackets += 1
+            audioPeak = max(audioPeak, peak)
+        }
+    }
+
     private func update(_ body: () -> Void) {
         lock.lock()
         body()
@@ -66,12 +79,13 @@ final class Stats {
 
     private func flush() {
         lock.lock()
-        let line = String(format: "stats cap=%d (maxgap %.0fms) enc=%d (avg %.1fms max %.1fms) sent=%d %.1fMbps drop=%d key=%d (max %dKB) inflight<=%d",
+        let line = String(format: "stats cap=%d (maxgap %.0fms) enc=%d (avg %.1fms max %.1fms) sent=%d %.1fMbps drop=%d key=%d (max %dKB) inflight<=%d audio=%d peak=%d",
                           captured, captureGapMsMax, encoded, encoded > 0 ? encodeMsTotal / Double(encoded) : 0, encodeMsMax,
                           sent, Double(sentBytes) * 8 / 1_000_000, dropped, keyframes, keyframeBytesMax / 1024,
-                          inFlightMax)
+                          inFlightMax, audioPackets, Int(audioPeak))
         captured = 0; captureGapMsMax = 0; encoded = 0; encodeMsTotal = 0; encodeMsMax = 0; sent = 0; sentBytes = 0
         dropped = 0; keyframes = 0; keyframeBytesMax = 0; inFlightMax = 0
+        audioPackets = 0; audioPeak = 0
         lock.unlock()
         print("firescreen: \(line)")
     }
