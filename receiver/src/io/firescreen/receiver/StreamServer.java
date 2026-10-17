@@ -25,8 +25,21 @@ import java.nio.charset.StandardCharsets;
  *   4 TIMED   [capture time us, i64 big-endian][access unit]; presented at the sender's cadence
  *   5 AUDIO   [capture time us of first sample, i64 big-endian][s16le interleaved PCM]
  *   6 AUDIOCFG ascii "sampleRate,channels"; (re)creates the audio player
+ *   7 AVOFFSET ascii "offsetMs,persist"; positive plays audio later; persist=1 stores it for this TV
+ *
+ * Receiver to sender, once on connect:
+ *   1 HELLO   ascii "protocolVersion|avOffsetMs|deviceName"
  */
 final class StreamServer extends Thread {
+
+    /** This TV's audio/video offset, kept on the device so any Mac gets it. */
+    interface Settings {
+        long avOffsetMs();
+
+        void saveAvOffsetMs(long ms);
+
+        String deviceName();
+    }
 
     interface Listener {
         void onStreaming(String description);
@@ -41,6 +54,9 @@ final class StreamServer extends Thread {
     private static final int TYPE_TIMED = 4;
     private static final int TYPE_AUDIO = 5;
     private static final int TYPE_AUDIO_CONFIG = 6;
+    private static final int TYPE_AV_OFFSET = 7;
+    private static final int TYPE_HELLO = 1;
+    static final int PROTOCOL_VERSION = 1;
     private static final int MAX_PACKET = 8 * 1024 * 1024;
     static final Stats STATS = new Stats();
     /** Per-frame in/out log for latency debugging: adb shell setprop log.tag.FireScreenTrace VERBOSE */
@@ -49,15 +65,17 @@ final class StreamServer extends Thread {
     private final int port;
     private final Surface surface;
     private final Listener listener;
+    private final Settings settings;
     private volatile boolean running = true;
     private ServerSocket serverSocket;
     private Socket client;
 
-    StreamServer(int port, Surface surface, Listener listener) {
+    StreamServer(int port, Surface surface, Listener listener, Settings settings) {
         super("firescreen-server");
         this.port = port;
         this.surface = surface;
         this.listener = listener;
+        this.settings = settings;
     }
 
     void shutdown() {
@@ -76,7 +94,7 @@ final class StreamServer extends Thread {
             serverSocket.setReuseAddress(true);
             serverSocket.bind(new InetSocketAddress(port));
         } catch (IOException e) {
-            listener.onIdle("Porta " + port + " non disponibile: " + e.getMessage());
+            listener.onIdle("Port " + port + " unavailable: " + e.getMessage());
             return;
         }
         while (running) {
@@ -86,9 +104,9 @@ final class StreamServer extends Thread {
                 client.setReceiveBufferSize(1024 * 1024);
                 Log.i(TAG, "sender connected: " + client.getRemoteSocketAddress());
                 serve(client);
-                listener.onIdle("Mac disconnesso");
+                listener.onIdle("Mac disconnected");
             } catch (IOException e) {
-                if (running) listener.onIdle("Errore: " + e.getMessage());
+                if (running) listener.onIdle("Error: " + e.getMessage());
             } finally {
                 closeQuietly(client);
             }
@@ -98,6 +116,8 @@ final class StreamServer extends Thread {
     private void serve(Socket socket) throws IOException {
         DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 256 * 1024));
         PlayoutClock clock = new PlayoutClock();
+        clock.setAvOffsetNs(settings.avOffsetMs() * 1_000_000L);
+        sendHello(socket);
         Decoder decoder = null;
         AudioPlayer audio = null;
         byte[] buf = new byte[512 * 1024];
@@ -151,6 +171,14 @@ final class StreamServer extends Thread {
                         if (audio != null) audio.release();
                         audio = new AudioPlayer(clock, Integer.parseInt(parts[0].trim()),
                                 Integer.parseInt(parts[1].trim()));
+                        break;
+                    }
+                    case TYPE_AV_OFFSET: {
+                        String[] parts = new String(buf, 0, length, StandardCharsets.US_ASCII).split(",");
+                        long ms = Long.parseLong(parts[0].trim());
+                        clock.setAvOffsetNs(ms * 1_000_000L);
+                        if (parts.length > 1 && parts[1].trim().equals("1")) settings.saveAvOffsetMs(ms);
+                        Log.i(TAG, "audio/video offset " + ms + " ms" + (parts.length > 1 ? " persist=" + parts[1] : ""));
                         break;
                     }
                     case TYPE_AUDIO:
@@ -248,6 +276,16 @@ final class StreamServer extends Thread {
             bytes = waitNs = decodeUsMax = decodeUsTotal = gapNsMax = shownGapNsMax = 0;
             windowStart = now;
         }
+    }
+
+    private void sendHello(Socket socket) throws IOException {
+        byte[] body = (PROTOCOL_VERSION + "|" + settings.avOffsetMs() + "|" + settings.deviceName().replace('|', ' '))
+                .getBytes(StandardCharsets.UTF_8);
+        java.io.DataOutputStream out = new java.io.DataOutputStream(socket.getOutputStream());
+        out.writeByte(TYPE_HELLO);
+        out.writeInt(body.length);
+        out.write(body);
+        out.flush();
     }
 
     private static void closeQuietly(Socket s) {

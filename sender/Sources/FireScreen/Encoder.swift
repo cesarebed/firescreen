@@ -1,4 +1,5 @@
 import CoreMedia
+import FireScreenCore
 import Foundation
 import VideoToolbox
 
@@ -13,7 +14,6 @@ final class Encoder {
     private var session: VTCompressionSession?
     private var forceKeyframe = true
     private var lastParameterSets: Data?
-    private static let startCode: [UInt8] = [0, 0, 0, 1]
 
     private let hevc: Bool
 
@@ -116,21 +116,8 @@ final class Encoder {
                                           totalLengthOut: &totalLength, dataPointerOut: &pointer) == noErr,
               let pointer else { return }
 
-        // AVCC (length-prefixed NAL units) -> Annex B (start-code-prefixed).
-        let bytes = UnsafeRawPointer(pointer)
-        var offset = 0
-        let prefix = Int(headerLength)
-        while offset + prefix <= totalLength {
-            var nalLength = 0
-            for i in 0..<prefix {
-                nalLength = (nalLength << 8) | Int(bytes.load(fromByteOffset: offset + i, as: UInt8.self))
-            }
-            offset += prefix
-            guard offset + nalLength <= totalLength else { break }
-            accessUnit.append(contentsOf: Self.startCode)
-            accessUnit.append(bytes.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: nalLength)
-            offset += nalLength
-        }
+        accessUnit.append(Media.annexB(fromLengthPrefixed: UnsafeRawBufferPointer(start: pointer, count: totalLength),
+                                       headerLength: Int(headerLength)))
         onFrame?(accessUnit, keyframe, CMSampleBufferGetPresentationTimeStamp(sample))
     }
 
@@ -150,7 +137,7 @@ final class Encoder {
             var size = 0
             guard parameterSet(format, hevc: hevc, index: index, pointer: &pointer, size: &size, count: nil,
                                headerLength: nil) == noErr, let pointer else { return nil }
-            result.append(contentsOf: startCode)
+            result.append(contentsOf: Media.startCode)
             result.append(pointer, count: size)
         }
         return result

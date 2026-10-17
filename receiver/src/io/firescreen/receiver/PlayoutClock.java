@@ -21,6 +21,13 @@ final class PlayoutClock {
     private long syncDelayNs;
     private static final long MAX_SYNC_DELAY_NS = 500_000_000L;
 
+    /** Per-TV calibration: positive plays audio later than the frame it belongs to. */
+    private volatile long avOffsetNs;
+
+    void setAvOffsetNs(long ns) {
+        avOffsetNs = ns;
+    }
+
     void setPlayoutDelayNs(long ns) {
         playoutDelayNs = ns;
     }
@@ -44,7 +51,7 @@ final class PlayoutClock {
 
     /** Audio follows when video is really shown, which includes decoder lateness. */
     synchronized long audioDueNs(long captureUs) {
-        return captureUs * 1000 + baselineNs + playoutDelayNs + syncDelayNs + videoLateNs;
+        return captureUs * 1000 + baselineNs + playoutDelayNs + syncDelayNs + videoLateNs + avOffsetNs;
     }
 
     /** Audio is late by lateNs even with a minimal queue: delay both streams to cancel it. */

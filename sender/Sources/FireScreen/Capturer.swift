@@ -1,4 +1,5 @@
 import CoreMedia
+import FireScreenCore
 import Foundation
 import ScreenCaptureKit
 
@@ -101,24 +102,13 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         let buffers = UnsafeMutableAudioBufferListPointer(list)
 
         func sampleAt(_ frame: Int, _ channel: Int) -> Float {
-            let c = min(channel, channels - 1) // mono source: duplicate into both outputs
-            if interleaved {
-                return buffers[0].mData!.assumingMemoryBound(to: Float.self)[frame * channels + c]
-            }
-            return buffers[c].mData!.assumingMemoryBound(to: Float.self)[frame]
+            interleaved
+                ? buffers[0].mData!.assumingMemoryBound(to: Float.self)[frame * channels + channel]
+                : buffers[channel].mData!.assumingMemoryBound(to: Float.self)[frame]
         }
 
-        var out = Data(count: frames * audioChannels * 2)
-        out.withUnsafeMutableBytes { raw in
-            let pcm = raw.bindMemory(to: Int16.self)
-            for frame in 0..<frames {
-                for channel in 0..<audioChannels {
-                    let v = max(-1, min(1, sampleAt(frame, channel)))
-                    pcm[frame * audioChannels + channel] = Int16(v * 32767).littleEndian
-                }
-            }
-        }
-        return out
+        return Media.int16Interleaved(frames: frames, sourceChannels: channels, outputChannels: audioChannels,
+                                      sample: sampleAt)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

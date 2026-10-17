@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sender:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -c release --package-path sender
+      - name: Self-test
+        run: swift run -c release --package-path sender FireScreenSelfTest
+
+  receiver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Android SDK packages
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;36.0.0" > /dev/null
+      - name: Unit checks
+        run: receiver/test.sh
+      - name: Build APK
+        run: receiver/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firescreen-receiver
+          path: receiver/build/firescreen-receiver.apk

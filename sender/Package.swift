@@ -10,15 +10,21 @@ let package = Package(
             name: "VirtualDisplay",
             linkerSettings: [.linkedFramework("CoreGraphics")]
         ),
+        // Pure logic (wire protocol, bitstream and PCM conversion, options): no capture, no UI.
+        .target(name: "FireScreenCore"),
         .executableTarget(
             name: "FireScreen",
-            dependencies: ["VirtualDisplay"],
+            dependencies: ["VirtualDisplay", "FireScreenCore"],
             linkerSettings: [
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("CoreMedia"),
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("Network"),
             ]
         ),
+        // `swift run FireScreenSelfTest`: checks FireScreenCore. Kept as a plain executable so it
+        // runs with the Command Line Tools alone, which ship neither XCTest nor swift-testing.
+        .executableTarget(name: "FireScreenSelfTest", dependencies: ["FireScreenCore"]),
     ]
 )

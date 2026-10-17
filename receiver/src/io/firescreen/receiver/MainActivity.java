@@ -2,6 +2,9 @@ package io.firescreen.receiver;
 
 import android.app.Activity;
 import android.graphics.Color;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
@@ -17,9 +20,14 @@ import java.net.NetworkInterface;
 import java.util.Collections;
 
 /** Full-screen surface plus a status line; the stream server renders into the surface. */
-public class MainActivity extends Activity implements SurfaceHolder.Callback, StreamServer.Listener {
+public class MainActivity extends Activity
+        implements SurfaceHolder.Callback, StreamServer.Listener, StreamServer.Settings {
 
     static final int PORT = 7878;
+    static final String SERVICE_TYPE = "_firescreen._tcp.";
+
+    private NsdManager nsd;
+    private NsdManager.RegistrationListener registration;
 
     private TextView status;
     private StreamServer server;
@@ -48,6 +56,57 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, St
         showWaiting();
     }
 
+    // StreamServer.Settings
+
+    @Override
+    public long avOffsetMs() {
+        return getSharedPreferences("firescreen", MODE_PRIVATE).getLong("avOffsetMs", 0);
+    }
+
+    @Override
+    public void saveAvOffsetMs(long ms) {
+        getSharedPreferences("firescreen", MODE_PRIVATE).edit().putLong("avOffsetMs", ms).apply();
+    }
+
+    @Override
+    public String deviceName() {
+        return Build.MODEL;
+    }
+
+    /** Lets the Mac find this TV on the network without typing an IP address. */
+    private void advertise() {
+        NsdServiceInfo info = new NsdServiceInfo();
+        info.setServiceName("FireScreen " + Build.MODEL);
+        info.setServiceType(SERVICE_TYPE);
+        info.setPort(PORT);
+        nsd = (NsdManager) getSystemService(NSD_SERVICE);
+        registration = new NsdManager.RegistrationListener() {
+            @Override public void onServiceRegistered(NsdServiceInfo i) { }
+            @Override public void onRegistrationFailed(NsdServiceInfo i, int error) { registration = null; }
+            @Override public void onServiceUnregistered(NsdServiceInfo i) { }
+            @Override public void onUnregistrationFailed(NsdServiceInfo i, int error) { }
+        };
+        nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registration);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        advertise();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (nsd != null && registration != null) {
+            try {
+                nsd.unregisterService(registration);
+            } catch (IllegalArgumentException ignored) {
+            }
+        }
+        registration = null;
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -62,7 +121,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, St
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        server = new StreamServer(PORT, holder.getSurface(), this);
+        server = new StreamServer(PORT, holder.getSurface(), this, this);
         server.start();
     }
 
@@ -104,7 +163,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, St
 
     private void showWaiting() {
         status.setVisibility(View.VISIBLE);
-        status.setText("FireScreen\n\nIn attesa del Mac su " + localAddress() + ":" + PORT);
+        status.setText("FireScreen\n\nWaiting for your Mac on " + localAddress() + ":" + PORT);
     }
 
     private static String localAddress() {
