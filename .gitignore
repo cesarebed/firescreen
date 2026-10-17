@@ -1,0 +1,5 @@
+build/
+.build/
+*.keystore
+*.app
+.DS_Store
